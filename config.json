@@ -1,0 +1,72 @@
+{
+  "system": {
+    "name": "M-Cog",
+    "version": "1.0.0",
+    "debug_mode": false
+  },
+  "scheduler": {
+    "max_concurrent_p0": 4,
+    "max_concurrent_p1": 2,
+    "max_concurrent_p2": 1,
+    "max_memory_mb": 4096,
+    "monitor_interval_ms": 10
+  },
+  "knowledge": {
+    "graph_db_path": "mutable/knowledge/graph.db",
+    "index_path": "mutable/knowledge/indices",
+    "quarantine_enabled": true,
+    "auto_promote_threshold": 0.8,
+    "decay_enabled": true,
+    "decay_interval_days": 7
+  },
+  "memory": {
+    "working_memory_path": "mutable/memory/working.json",
+    "episodic_db_path": "mutable/memory/episodic.db",
+    "max_working_facts": 100,
+    "episode_importance_threshold": 0.5
+  },
+  "models": {
+    "experts_dir": "mutable/models/experts",
+    "router_path": "mutable/models/router.onnx",
+    "max_active_experts": 3,
+    "quantization": "int8"
+  },
+  "tools": {
+    "registry_path": "mutable/tools/registry.json",
+    "sources_dir": "mutable/tools/sources",
+    "compiled_dir": "mutable/tools/compiled",
+    "sandbox_enabled": true,
+    "max_tool_cpu_ms": 100,
+    "max_tool_memory_mb": 50
+  },
+  "evolution": {
+    "enabled": true,
+    "logs_db_path": "mutable/evolution_logs/changes.db",
+    "snapshots_dir": "mutable/evolution_logs/snapshots",
+    "snapshot_interval_hours": 24,
+    "max_snapshots": 30
+  },
+  "reflection": {
+    "micro_trigger_threshold": 0.3,
+    "macro_trigger_days": 3,
+    "deep_trigger_days": 7,
+    "min_episodes_for_analysis": 100
+  },
+  "learning": {
+    "user_feedback_weight": 0.8,
+    "self_play_weight": 0.3,
+    "doc_ingestion_weight": 0.5,
+    "sleep_replay_enabled": true,
+    "sleep_replay_time": "02:00"
+  },
+  "safety": {
+    "core_module_path": "core/safety_hardcode.so",
+    "strict_mode": true,
+    "log_all_checks": true
+  },
+  "webui": {
+    "host": "127.0.0.1",
+    "port": 5000,
+    "debug": false
+  }
+}

@@ -173,6 +173,10 @@ class Bootstrapper:
             # 加载种子数据
             if seed_data:
                 self._load_seed_data(cursor, seed_data)
+            
+            # 提交所有更改
+            conn.commit()
+            logger.info("Knowledge graph initialization complete")
                 
         except Exception as e:
             logger.error(f"Failed to initialize knowledge graph: {e}")

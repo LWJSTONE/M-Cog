@@ -12,11 +12,10 @@ import sys
 import json
 import logging
 import argparse
-import signal
 import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 
 # 添加项目根目录到路径
 PROJECT_ROOT = Path(__file__).parent
@@ -34,10 +33,6 @@ def setup_logging(config: Dict) -> logging.Logger:
         format=log_format,
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(
-                PROJECT_ROOT / "m-cog.log",
-                encoding='utf-8'
-            )
         ]
     )
     
@@ -247,22 +242,12 @@ class MCogSystem:
             return self._safety_module.check_safety(action_bytes, target_bytes) == 1
         
         # Python fallback
-        # 简化的安全检查
         forbidden_keywords = ["harm", "kill", "bomb", "attack", "欺骗", "伤害"]
         combined = f"{action} {target}".lower()
         return not any(kw in combined for kw in forbidden_keywords)
     
     def process_input(self, user_input: str, context: Dict = None) -> Dict:
-        """
-        处理用户输入
-        
-        Args:
-            user_input: 用户输入文本
-            context: 上下文信息
-        
-        Returns:
-            处理结果
-        """
+        """处理用户输入"""
         context = context or {}
         start_time = datetime.now()
         
@@ -281,18 +266,16 @@ class MCogSystem:
         # 查询知识库
         knowledge_results = []
         if self._knowledge_engine:
-            # 简单实体提取
             entities = self._extract_entities(user_input)
-            for entity in entities[:3]:  # 限制查询数量
+            for entity in entities[:3]:
                 results = self._knowledge_engine.query(entity, "is")
                 knowledge_results.extend([r.to_dict() for r in results])
         
         # 专家路由推理
         expert_result = None
         if self._expert_router:
-            # 创建简单的输入嵌入（实际应用中应使用真正的嵌入模型）
             import numpy as np
-            input_embedding = np.random.randn(768)  # 占位符
+            input_embedding = np.random.randn(768)
             
             route_result = self._expert_router.route(input_embedding)
             if route_result.experts:
@@ -303,7 +286,7 @@ class MCogSystem:
         
         # 辩证分析（如果涉及伦理问题）
         dialectic_result = None
-        if self._should_dialectic_analysis(user_input):
+        if self._should_dialectic_analysis(user_input) and self._dialectic_engine:
             dialectic_result = self._dialectic_engine.analyze(user_input)
             dialectic_result = dialectic_result.to_dict()
         
@@ -333,7 +316,6 @@ class MCogSystem:
     
     def _extract_entities(self, text: str) -> List[str]:
         """简单实体提取"""
-        # 简化实现：按空格分割并过滤
         words = text.split()
         entities = [w for w in words if len(w) > 2 and w.isalpha()]
         return entities[:5]
@@ -346,22 +328,17 @@ class MCogSystem:
     def _build_response(self, user_input: str, knowledge_results: List,
                        expert_result: Dict, dialectic_result: Dict) -> Dict:
         """构建响应"""
-        # 基础响应
         output_parts = []
         
-        # 知识支持
         if knowledge_results:
             output_parts.append(f"根据知识库，找到 {len(knowledge_results)} 条相关信息。")
         
-        # 专家意见
         if expert_result and expert_result.get("status") == "success":
             output_parts.append("专家分析完成。")
         
-        # 伦理分析
         if dialectic_result:
             output_parts.append(f"伦理分析: {dialectic_result.get('recommendation', '')}")
         
-        # 如果没有特殊处理，给出通用响应
         if not output_parts:
             output_parts.append(f"已收到您的输入。M-Cog 正在学习中，将逐步提升响应质量。")
         
@@ -373,54 +350,6 @@ class MCogSystem:
             "dialectic_performed": dialectic_result is not None,
             "timestamp": datetime.now().isoformat()
         }
-    
-    def record_feedback(self, episode_id: int, feedback: str,
-                       satisfaction: float) -> None:
-        """记录用户反馈"""
-        if self._memory_system:
-            # 更新情景记忆
-            episode = self._memory_system.episodic.get_episode(episode_id)
-            if episode:
-                self._memory_system.episodic.store_episode(
-                    user_input=episode.user_input,
-                    system_output=episode.system_output,
-                    user_feedback=feedback,
-                    satisfaction_score=satisfaction
-                )
-        
-        if self._meta_controller:
-            self._meta_controller.monitor_feedback(
-                user_input="",
-                output="",
-                feedback=feedback,
-                satisfaction=satisfaction
-            )
-    
-    def run_evolution_cycle(self) -> Dict:
-        """运行进化周期"""
-        results = {
-            "knowledge_update": 0,
-            "tools_created": 0,
-            "reflection_triggered": False,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        # 睡眠重放
-        if self._memory_system and self.config["learning"].get("sleep_replay_enabled"):
-            replay_stats = self._memory_system.run_sleep_cycle()
-            results["sleep_replay"] = replay_stats
-        
-        # 知识衰减
-        if self._knowledge_engine and self.config["knowledge"].get("decay_enabled"):
-            deleted = self._knowledge_engine.decay_knowledge()
-            results["knowledge_decayed"] = deleted
-        
-        # 工具审计
-        if self._tool_factory:
-            audit = self._tool_factory.audit_tools()
-            results["tool_audit"] = audit
-        
-        return results
     
     def get_system_status(self) -> Dict:
         """获取系统状态"""
@@ -441,7 +370,6 @@ class MCogSystem:
             }
         }
         
-        # 添加统计信息
         if self._knowledge_engine:
             status["knowledge_stats"] = self._knowledge_engine.get_statistics()
         
@@ -473,34 +401,7 @@ class MCogSystem:
         if self._meta_controller:
             self._meta_controller.start_background_scheduler(interval_seconds=60)
         
-        # 启动 WebUI（可选）
-        if enable_webui:
-            self._start_webui()
-        
         self.logger.info("M-Cog system started successfully")
-    
-    def _start_webui(self) -> None:
-        """启动 WebUI"""
-        try:
-            import threading
-            from webui.app import create_app
-            
-            app = create_app(self)
-            
-            def run_app():
-                app.run(
-                    host=self.config["webui"]["host"],
-                    port=self.config["webui"]["port"],
-                    debug=self.config["webui"]["debug"]
-                )
-            
-            webui_thread = threading.Thread(target=run_app, daemon=True)
-            webui_thread.start()
-            
-            self.logger.info(f"WebUI started at http://{self.config['webui']['host']}:{self.config['webui']['port']}")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to start WebUI: {e}")
     
     def stop(self) -> None:
         """停止系统"""
@@ -509,11 +410,9 @@ class MCogSystem:
         self.running = False
         self._shutdown_event.set()
         
-        # 停止元认知调度
         if self._meta_controller:
             self._meta_controller.stop_background_scheduler()
         
-        # 关闭数据库连接
         if self._knowledge_engine:
             self._knowledge_engine.close()
         
@@ -527,7 +426,6 @@ class MCogSystem:
         print("M-Cog 交互模式")
         print("输入 'quit' 或 'exit' 退出")
         print("输入 'status' 查看系统状态")
-        print("输入 'evolve' 触发进化周期")
         print("="*60 + "\n")
         
         try:
@@ -544,11 +442,6 @@ class MCogSystem:
                     if user_input.lower() == 'status':
                         status = self.get_system_status()
                         print(json.dumps(status, indent=2, default=str))
-                        continue
-                    
-                    if user_input.lower() == 'evolve':
-                        results = self.run_evolution_cycle()
-                        print(f"Evolution cycle completed: {json.dumps(results, indent=2)}")
                         continue
                     
                     # 处理输入
@@ -570,45 +463,20 @@ def main():
     parser = argparse.ArgumentParser(
         description='M-Cog: Meta-Cognitive Autonomous Evolutionary System'
     )
-    parser.add_argument(
-        '--config', '-c',
-        type=str,
-        default=None,
-        help='Path to configuration file'
-    )
-    parser.add_argument(
-        '--bootstrap', '-b',
-        action='store_true',
-        help='Run bootstrap initialization'
-    )
-    parser.add_argument(
-        '--seed-data', '-s',
-        type=str,
-        default=None,
-        help='Path to seed data JSON file for bootstrap'
-    )
-    parser.add_argument(
-        '--webui', '-w',
-        action='store_true',
-        help='Enable WebUI'
-    )
-    parser.add_argument(
-        '--interactive', '-i',
-        action='store_true',
-        default=True,
-        help='Run in interactive mode (default)'
-    )
-    parser.add_argument(
-        '--status',
-        action='store_true',
-        help='Show system status and exit'
-    )
+    parser.add_argument('--config', '-c', type=str, default=None,
+                       help='Path to configuration file')
+    parser.add_argument('--bootstrap', '-b', action='store_true',
+                       help='Run bootstrap initialization')
+    parser.add_argument('--seed-data', '-s', type=str, default=None,
+                       help='Path to seed data JSON file for bootstrap')
+    parser.add_argument('--status', action='store_true',
+                       help='Show system status and exit')
     
     args = parser.parse_args()
     
     # 引导模式
     if args.bootstrap:
-        from core.bootstrapper import Bootstrapper
+        from bootstrapper import Bootstrapper
         bootstrapper = Bootstrapper(PROJECT_ROOT)
         success = bootstrapper.bootstrap(args.seed_data)
         sys.exit(0 if success else 1)
@@ -625,17 +493,7 @@ def main():
         sys.exit(0)
     
     # 交互模式
-    if args.interactive:
-        system.run_interactive()
-    else:
-        system.start(enable_webui=args.webui)
-        # 等待关闭信号
-        try:
-            while system.running:
-                import time
-                time.sleep(1)
-        except KeyboardInterrupt:
-            system.stop()
+    system.run_interactive()
 
 
 if __name__ == '__main__':
