@@ -2,19 +2,34 @@
 """
 M-Cog 知识引擎
 负责知识查询、更新、一致性校验、置信度传播
+集成了FAISS向量索引支持语义搜索
 """
 
 import json
 import sqlite3
 import logging
 import hashlib
+import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any, Set
+from typing import Dict, List, Tuple, Optional, Any, Set, Union
 from dataclasses import dataclass, asdict
 from enum import Enum
 import threading
 import time
+
+# 导入向量索引模块
+try:
+    from vector_index import (
+        VectorIndex, 
+        VectorIndexConfig, 
+        SemanticKnowledgeIndex,
+        FAISS_AVAILABLE
+    )
+    VECTOR_INDEX_AVAILABLE = True
+except ImportError:
+    VECTOR_INDEX_AVAILABLE = False
+    FAISS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +150,7 @@ class QueryResult:
 
 
 class KnowledgeEngine:
-    """知识引擎核心类"""
+    """知识引擎核心类 - 集成向量索引支持语义搜索"""
     
     def __init__(self, db_path: str, config: Dict = None):
         self.db_path = Path(db_path)
@@ -149,11 +164,68 @@ class KnowledgeEngine:
         self._node_cache: Dict[str, KnowledgeNode] = {}
         self._cache_lock = threading.RLock()
         
+        # 向量索引（语义搜索）
+        self._vector_index: Optional[VectorIndex] = None
+        self._semantic_index: Optional[SemanticKnowledgeIndex] = None
+        self._vector_index_enabled = self.config.get("enable_vector_index", True)
+        self._vector_dimension = self.config.get("vector_dimension", 768)
+        
         # 初始化
         self._ensure_tables()
         self._load_cache()
         
-        logger.info(f"KnowledgeEngine initialized with db: {self.db_path}")
+        # 初始化向量索引
+        if self._vector_index_enabled:
+            self._init_vector_index()
+        
+        logger.info(f"KnowledgeEngine initialized with db: {self.db_path}, vector_index: {self._vector_index is not None}")
+    
+    def _init_vector_index(self) -> None:
+        """初始化向量索引"""
+        if not VECTOR_INDEX_AVAILABLE:
+            logger.warning("Vector index module not available, semantic search disabled")
+            return
+        
+        try:
+            # 确定向量索引存储路径
+            index_path = self.db_path.parent / "vector_index"
+            
+            # 创建向量索引配置
+            index_config = VectorIndexConfig(
+                dimension=self._vector_dimension,
+                index_type=self.config.get("vector_index_type", "Flat"),
+                metric=self.config.get("vector_metric", "cosine")
+            )
+            
+            # 创建向量索引
+            self._vector_index = VectorIndex(index_config, index_path if index_path.exists() else None)
+            
+            # 创建语义知识索引
+            self._semantic_index = SemanticKnowledgeIndex(self, index_config)
+            
+            # 如果索引为空，索引现有知识节点
+            if self._vector_index.get_vector_count() == 0:
+                self._index_existing_nodes()
+            
+            logger.info(f"Vector index initialized: backend={self._vector_index.get_backend()}, vectors={self._vector_index.get_vector_count()}")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize vector index: {e}")
+            self._vector_index = None
+            self._semantic_index = None
+    
+    def _index_existing_nodes(self) -> int:
+        """索引现有知识节点"""
+        if not self._semantic_index:
+            return 0
+        
+        try:
+            count = self._semantic_index.index_knowledge_nodes()
+            logger.info(f"Indexed {count} existing knowledge nodes")
+            return count
+        except Exception as e:
+            logger.error(f"Failed to index existing nodes: {e}")
+            return 0
     
     def _get_connection(self) -> sqlite3.Connection:
         """获取线程本地数据库连接"""
@@ -539,7 +611,7 @@ class KnowledgeEngine:
             return self._node_cache.get(name.lower())
     
     def search_nodes(self, query: str, limit: int = 10) -> List[KnowledgeNode]:
-        """搜索节点"""
+        """搜索节点（关键词匹配）"""
         results = []
         query_lower = query.lower()
         
@@ -551,6 +623,114 @@ class KnowledgeEngine:
                         break
         
         return results
+    
+    def semantic_search(self, query_embedding: np.ndarray, k: int = 10,
+                       keyword: str = None) -> List[Dict]:
+        """
+        语义搜索
+        
+        Args:
+            query_embedding: 查询嵌入向量
+            k: 返回结果数量
+            keyword: 可选的关键词过滤
+        
+        Returns:
+            搜索结果列表
+        """
+        if not self._semantic_index:
+            logger.warning("Semantic search not available, falling back to keyword search")
+            # 回退到关键词搜索
+            if keyword:
+                nodes = self.search_nodes(keyword, k)
+                return [{
+                    "node_id": n.id,
+                    "name": n.name,
+                    "type": n.type.value,
+                    "description": n.description,
+                    "score": 1.0 if keyword.lower() in n.name.lower() else 0.5
+                } for n in nodes]
+            return []
+        
+        return self._semantic_index.hybrid_search(query_embedding, keyword, k)
+    
+    def find_similar_nodes(self, node_name: str, k: int = 10) -> List[Dict]:
+        """
+        查找与指定节点相似的节点
+        
+        Args:
+            node_name: 节点名称
+            k: 返回结果数量
+        
+        Returns:
+            相似节点列表
+        """
+        if not self._vector_index or self._vector_index.get_vector_count() == 0:
+            return []
+        
+        # 生成节点嵌入
+        np.random.seed(hash(node_name) % (2**32))
+        node_embedding = np.random.randn(self._vector_dimension).astype(np.float32)
+        
+        # 搜索相似节点
+        results = self._vector_index.search(node_embedding, k + 1)  # +1 因为会包含自己
+        
+        # 过滤掉自己
+        return [
+            {
+                "id": r.id,
+                "score": r.score,
+                "name": r.metadata.get("name"),
+                "type": r.metadata.get("type"),
+                "description": r.metadata.get("description")
+            }
+            for r in results if r.metadata.get("name", "").lower() != node_name.lower()
+        ][:k]
+    
+    def is_vector_index_enabled(self) -> bool:
+        """检查向量索引是否启用"""
+        return self._vector_index is not None
+    
+    def get_vector_index_stats(self) -> Dict:
+        """获取向量索引统计信息"""
+        if not self._vector_index:
+            return {"enabled": False}
+        
+        return {
+            "enabled": True,
+            "backend": self._vector_index.get_backend(),
+            "vector_count": self._vector_index.get_vector_count(),
+            "dimension": self._vector_dimension,
+            "faiss_available": FAISS_AVAILABLE
+        }
+    
+    def rebuild_vector_index(self) -> bool:
+        """重建向量索引"""
+        if not self._vector_index:
+            logger.warning("Vector index not enabled")
+            return False
+        
+        try:
+            # 重新索引所有节点
+            count = self._index_existing_nodes()
+            logger.info(f"Rebuilt vector index with {count} nodes")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to rebuild vector index: {e}")
+            return False
+    
+    def save_vector_index(self, path: Path = None) -> bool:
+        """保存向量索引"""
+        if not self._vector_index:
+            return False
+        
+        try:
+            save_path = path or self.db_path.parent / "vector_index"
+            self._vector_index.save(save_path)
+            logger.info(f"Vector index saved to {save_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save vector index: {e}")
+            return False
     
     def get_statistics(self) -> Dict:
         """获取知识库统计信息"""
@@ -569,12 +749,15 @@ class KnowledgeEngine:
         cursor.execute("SELECT COUNT(*) FROM value_layers")
         value_count = cursor.fetchone()[0]
         
-        return {
+        stats = {
             "nodes": node_count,
             "relations": relation_count,
             "pending_quarantine": quarantine_count,
-            "values": value_count
+            "values": value_count,
+            "vector_index": self.get_vector_index_stats()
         }
+        
+        return stats
     
     def export_knowledge(self, format: str = "json") -> str:
         """导出知识库"""

@@ -2,17 +2,31 @@
 """
 M-Cog 专家路由系统
 负责根据输入选择最相关的专家，执行推理
+支持真实的神经网络专家模型和模拟模型
 """
 
 import json
 import logging
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 import threading
 import time
+
+# 导入神经网络专家模型
+try:
+    from neural_expert import (
+        NeuralExpertModel, 
+        TransformerConfig, 
+        ExpertModelFactory,
+        TORCH_AVAILABLE
+    )
+    NEURAL_EXPERT_AVAILABLE = True
+except ImportError:
+    NEURAL_EXPERT_AVAILABLE = False
+    TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +108,7 @@ class InferenceResult:
 
 
 class MockExpertModel:
-    """模拟专家模型（用于开发测试）"""
+    """模拟专家模型（用于开发测试和回退）"""
     
     def __init__(self, config: ExpertConfig):
         self.config = config
@@ -120,39 +134,108 @@ class MockExpertModel:
         
         output = np.dot(x, self.weights)
         return output
+    
+    def quantize(self, bits: int = 8) -> None:
+        """量化接口（兼容）"""
+        pass
+    
+    def save(self, path: Path) -> None:
+        """保存接口（兼容）"""
+        np.save(path / "mock_weights.npy", self.weights)
+    
+    def load(self, path: Path) -> None:
+        """加载接口（兼容）"""
+        weight_file = path / "mock_weights.npy"
+        if weight_file.exists():
+            self.weights = np.load(weight_file)
+    
+    def get_parameter_count(self) -> int:
+        """获取参数数量"""
+        return self.weights.size
 
 
 class Expert:
-    """专家实例"""
+    """专家实例 - 支持真实神经网络模型和模拟模型"""
     
-    def __init__(self, config: ExpertConfig, model_dir: Path):
+    def __init__(self, config: ExpertConfig, model_dir: Path, use_neural: bool = True):
         self.config = config
         self.model_dir = model_dir
-        self.model: Optional[MockExpertModel] = None
+        self.model: Optional[Union[MockExpertModel, NeuralExpertModel]] = None
+        self.model_type: str = "unknown"
         self.usage_count = 0
         self.success_count = 0
         self.total_inference_time = 0.0
         self._lock = threading.Lock()
+        self.use_neural = use_neural and NEURAL_EXPERT_AVAILABLE
         
         # 加载模型
         self._load_model()
     
     def _load_model(self) -> None:
-        """加载模型"""
-        # 检查是否有保存的权重文件
+        """加载模型 - 优先使用真实神经网络模型"""
+        # 检查是否有神经网络模型文件
+        neural_model_path = self.model_dir / "neural_model"
+        has_neural_model = neural_model_path.exists() and (neural_model_path / "weights.npz").exists()
+        
+        if self.use_neural and (has_neural_model or NEURAL_EXPERT_AVAILABLE):
+            try:
+                # 尝试加载或创建神经网络模型
+                if has_neural_model:
+                    # 从文件加载
+                    config_path = neural_model_path / "config.json"
+                    if config_path.exists():
+                        with open(config_path, 'r') as f:
+                            model_config = TransformerConfig.from_dict(json.load(f))
+                    else:
+                        # 使用默认配置
+                        model_config = TransformerConfig(
+                            hidden_size=self.config.input_dim,
+                            num_hidden_layers=4,
+                            num_attention_heads=4,
+                            intermediate_size=self.config.input_dim * 2
+                        )
+                    
+                    self.model = NeuralExpertModel(model_config, self.config.expert_id)
+                    self.model.load(neural_model_path)
+                    self.model_type = "transformer_loaded"
+                    logger.info(f"Loaded neural network expert: {self.config.expert_id}")
+                else:
+                    # 创建新的神经网络模型
+                    model_config = TransformerConfig(
+                        hidden_size=min(self.config.input_dim, 256),
+                        num_hidden_layers=4,
+                        num_attention_heads=4,
+                        intermediate_size=512
+                    )
+                    self.model = NeuralExpertModel(model_config, self.config.expert_id)
+                    
+                    # 如果配置了量化，执行量化
+                    if self.config.quantization == "int8":
+                        self.model.quantize(bits=8)
+                    
+                    self.model_type = "transformer_new"
+                    logger.info(f"Created new neural network expert: {self.config.expert_id}")
+                
+                # 记录参数数量
+                param_count = self.model.get_parameter_count()
+                logger.info(f"Expert {self.config.expert_id} has {param_count:,} parameters")
+                return
+                
+            except Exception as e:
+                logger.warning(f"Failed to load neural model for {self.config.expert_id}: {e}, falling back to mock")
+        
+        # 回退到模拟模型
         weight_file = self.model_dir / "model.quantized"
+        self.model = MockExpertModel(self.config)
+        self.model_type = "mock"
         
         if weight_file.exists():
-            # 尝试加载权重
             try:
-                self.model = MockExpertModel(self.config)
-                logger.info(f"Loaded expert: {self.config.expert_id}")
+                self.model.load(self.model_dir)
+                logger.info(f"Loaded mock expert weights: {self.config.expert_id}")
             except Exception as e:
-                logger.warning(f"Failed to load expert weights: {e}, using mock")
-                self.model = MockExpertModel(self.config)
+                logger.warning(f"Failed to load mock weights: {e}")
         else:
-            # 使用模拟模型
-            self.model = MockExpertModel(self.config)
             logger.info(f"Using mock model for expert: {self.config.expert_id}")
     
     def infer(self, input_data: np.ndarray) -> np.ndarray:
@@ -164,7 +247,21 @@ class Expert:
             start_time = time.time()
             
             try:
-                output = self.model.forward(input_data)
+                # 根据模型类型选择推理方式
+                if isinstance(self.model, NeuralExpertModel):
+                    # 神经网络模型推理
+                    output = self.model.forward(input_embedding=input_data)
+                    # 确保输出维度匹配
+                    if output.shape[-1] != self.config.output_dim:
+                        # 简单的线性投影调整维度
+                        if not hasattr(self, '_output_adapter'):
+                            self._output_adapter = np.random.randn(
+                                output.shape[-1], self.config.output_dim
+                            ).astype(np.float32) * 0.1
+                        output = np.dot(output, self._output_adapter)
+                else:
+                    # 模拟模型推理
+                    output = self.model.forward(input_data)
                 
                 # 更新统计
                 self.usage_count += 1
@@ -174,6 +271,7 @@ class Expert:
                 return output
             except Exception as e:
                 self.usage_count += 1
+                logger.error(f"Expert {self.config.expert_id} inference error: {e}")
                 raise e
     
     def get_statistics(self) -> Dict:
@@ -184,13 +282,36 @@ class Expert:
             success_rate = (self.success_count / self.usage_count 
                            if self.usage_count > 0 else 0)
             
-            return {
+            stats = {
                 "expert_id": self.config.expert_id,
                 "domain": self.config.domain,
+                "model_type": self.model_type,
                 "usage_count": self.usage_count,
                 "success_rate": success_rate,
                 "avg_inference_time_ms": avg_time
             }
+            
+            # 如果是神经网络模型，添加参数数量
+            if isinstance(self.model, NeuralExpertModel):
+                stats["parameter_count"] = self.model.get_parameter_count()
+                stats["quantized"] = self.model.quantized
+            
+            return stats
+    
+    def save_model(self) -> bool:
+        """保存模型到磁盘"""
+        try:
+            if isinstance(self.model, NeuralExpertModel):
+                neural_path = self.model_dir / "neural_model"
+                self.model.save(neural_path)
+                logger.info(f"Saved neural model for {self.config.expert_id}")
+            elif isinstance(self.model, MockExpertModel):
+                self.model.save(self.model_dir)
+                logger.info(f"Saved mock model for {self.config.expert_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save model for {self.config.expert_id}: {e}")
+            return False
 
 
 class Router:
@@ -510,14 +631,14 @@ class ExpertRouter:
         return stats
     
     def create_default_experts(self) -> None:
-        """创建默认专家集"""
+        """创建默认专家集 - 使用Transformer架构"""
         default_configs = [
             ExpertConfig(
                 expert_id="exp_general",
                 domain="general_qa",
                 input_dim=768,
                 output_dim=256,
-                architecture="MLP_3layer",
+                architecture="Transformer_4layer",  # 更新架构名称
                 router_embedding=list(np.random.randn(768) * 0.1)
             ),
             ExpertConfig(
@@ -525,7 +646,7 @@ class ExpertRouter:
                 domain="logical_reasoning",
                 input_dim=768,
                 output_dim=256,
-                architecture="MLP_3layer",
+                architecture="Transformer_4layer",
                 router_embedding=list(np.random.randn(768) * 0.1 + 0.5)
             ),
             ExpertConfig(
@@ -533,7 +654,7 @@ class ExpertRouter:
                 domain="knowledge_retrieval",
                 input_dim=768,
                 output_dim=256,
-                architecture="MLP_3layer",
+                architecture="Transformer_4layer",
                 router_embedding=list(np.random.randn(768) * 0.1 - 0.5)
             ),
         ]
@@ -541,7 +662,19 @@ class ExpertRouter:
         for config in default_configs:
             self.add_expert(config)
         
-        logger.info(f"Created {len(default_configs)} default experts")
+        logger.info(f"Created {len(default_configs)} default experts with Transformer architecture")
+    
+    def get_system_info(self) -> Dict:
+        """获取系统信息"""
+        return {
+            "neural_expert_available": NEURAL_EXPERT_AVAILABLE,
+            "torch_available": TORCH_AVAILABLE,
+            "total_experts": len(self.experts),
+            "expert_types": {
+                expert_id: expert.model_type 
+                for expert_id, expert in self.experts.items()
+            }
+        }
 
 
 # 测试代码
